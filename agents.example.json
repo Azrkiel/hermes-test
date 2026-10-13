@@ -1,0 +1,24 @@
+{
+  "agents": {
+    "claude": {
+      "family": "claude",
+      "build": ["claude", "-p", "--restricted", "--permission-mode", "acceptEdits", "--permission-prompts", "none", "--tools", "Read,Edit,Write,Glob,Grep", "--allowedTools", "Read,Edit,Write,Glob,Grep", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--", "{prompt}"],
+      "review": ["claude", "-p", "--restricted", "--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep", "--allowedTools", "Read,Glob,Grep", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--", "{prompt}"],
+      "env": {}
+    },
+    "codex": {
+      "family": "codex",
+      "build": ["codex", "exec", "--sandbox", "workspace-write", "--ignore-user-config", "--color", "never", "-"],
+      "review": ["codex", "exec", "--sandbox", "read-only", "--ignore-user-config", "--color", "never", "--output-last-message", "{result_file}", "-"],
+      "result_file": true,
+      "stdin_prompt": true,
+      "env": {}
+    },
+    "opencode": {
+      "family": "opencode",
+      "build": ["opencode", "run", "--standalone", "--auto", "{prompt}"],
+      "review": ["opencode", "run", "--standalone", "--agent", "plan", "{prompt}"],
+      "env": {}
+    }
+  }
+}
