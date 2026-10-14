@@ -59,13 +59,14 @@ def get_diff(repo: str, task_id: str, max_chars: int = 50000) -> dict[str, Any]:
 
 @mcp.tool()
 def review_task(repo: str, task_id: str, agent: str = 'codex',
-                prompt: str = '') -> dict[str, Any]:
+                prompt: str = '', timeout_min: float | None = None) -> dict[str, Any]:
     """Queue isolated review by a different agent family; return immediately.
 
     Review result appears in get_status. Approval requires a single strict verdict
     and an unchanged snapshot. A changed task invalidates its old approval.
     """
-    return bridge().review_task(repo=repo, task_id=task_id, agent=agent, prompt=prompt)
+    return bridge().review_task(repo=repo, task_id=task_id, agent=agent, prompt=prompt,
+                                timeout_min=timeout_min)
 
 
 @mcp.tool()
@@ -94,6 +95,42 @@ def cleanup_task(repo: str, task_id: str, force: bool = False) -> dict[str, Any]
 def list_agents() -> dict[str, Any] | list[dict[str, Any]]:
     """List configured CLI workers, families, commands and availability."""
     return bridge().list_agents()
+
+
+@mcp.tool()
+def dispatch_swarm(repo: str, tasks: list[dict[str, Any]], agent: str = 'opencode',
+                   reviewer: str = 'codex', fallback: str | None = 'claude-haiku-max',
+                   workers: int = 3, timeout_min: float = 15) -> dict[str, Any]:
+    """Run 1-200 independent, nonoverlapping shards with tests and fresh reviews.
+
+    Each shard: name, prompt, files (literal relative paths), test_cmd (trusted
+    argv). Requires a clean committed baseline. Bounded per-repo workers; one
+    explicit fallback for test/review rejection. No integration, merge or push.
+    Worktrees are NOT an OS sandbox; free model data policies still apply.
+    """
+    from bridge_swarm import Swarm
+    return Swarm(bridge()).start(repo, tasks, agent, reviewer, workers, fallback, timeout_min)
+
+
+@mcp.tool()
+def get_swarm(repo: str, swarm_id: str) -> dict[str, Any]:
+    """Get fresh gated state; bounded recovery of dead autonomous coordinators."""
+    from bridge_swarm import Swarm
+    return Swarm(bridge()).status(repo, swarm_id)
+
+
+@mcp.tool()
+def cancel_swarm(repo: str, swarm_id: str) -> dict[str, Any]:
+    """Request cooperative cancellation of this swarm, retaining all artifacts."""
+    from bridge_swarm import Swarm
+    return Swarm(bridge()).cancel(repo, swarm_id)
+
+
+@mcp.tool()
+def list_swarms(repo: str, limit: int = 20) -> list[dict[str, Any]]:
+    """List recent swarms with fresh approvals; may recover dead coordinators."""
+    from bridge_swarm import Swarm
+    return Swarm(bridge()).list(repo, limit)
 
 
 if __name__ == '__main__':

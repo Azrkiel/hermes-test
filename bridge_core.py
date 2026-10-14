@@ -62,9 +62,9 @@ def log_tail(path, lines=40, max_bytes=65536):
 
 
 @contextmanager
-def database(repo):
-    db = sqlite3.connect(str(safe_state(repo) / 'state.sqlite'), timeout=30)
-    db.execute('PRAGMA busy_timeout=30000')
+def database(repo, timeout=30):
+    db = sqlite3.connect(str(safe_state(repo) / 'state.sqlite'), timeout=timeout)
+    db.execute(f'PRAGMA busy_timeout={int(timeout * 1000)}')
     try:
         db.execute('BEGIN IMMEDIATE')
         yield db
@@ -138,7 +138,31 @@ class BridgeError(ValueError):
     """Invalid request, unsafe path, or unavailable bridge resource."""
 
 
+class SwarmStopped(BridgeError):
+    """A durable swarm cancellation/terminal state forbids another launch."""
+
+
+def check_swarm_launch(db, swarm_id):
+    if swarm_id is None:
+        return
+    if not isinstance(swarm_id, str) or not re.fullmatch(r'[0-9a-f]{32}', swarm_id):
+        raise BridgeError('invalid swarm ID')
+    row = db.execute('SELECT data FROM swarms WHERE id=?', (swarm_id,)).fetchone()
+    if not row:
+        raise BridgeError('unknown swarm')
+    data = json.loads(row[0])
+    if data.get('cancel_requested') or data['status'] not in ('queued', 'running'):
+        raise SwarmStopped('swarm no longer permits dispatch')
+
+
 def git(repo, *args, strip=True):
+    if args and args[0] in ('diff', 'ls-files'):
+        limit = 8 * 1024 * 1024 if args[0] == 'diff' else 1000000
+        text, total, _ = bounded_git(repo, args, limit)
+        if total > limit:
+            raise BridgeError('Git output exceeds safety limit')
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        return text.strip() if strip else text
     result = subprocess.run(['git', '-C', str(repo), *args], capture_output=True, text=True,
                             encoding='utf-8', errors='replace', timeout=60, stdin=subprocess.DEVNULL)
     if result.returncode:
@@ -173,6 +197,60 @@ def windows_worker(argv, cwd):
         # Release COM wrappers while this thread's apartment is still alive.
         result = params = startup = service = None
         pythoncom.CoUninitialize()
+
+
+def child_env(config):
+    """Build a private environment: trusted removals precede explicit overrides."""
+    env = os.environ.copy()
+    for key in config.get('unset_env', []):
+        # Windows environment names are case-insensitive, unlike a copied dict.
+        for inherited in list(env):
+            if inherited == key or os.name == 'nt' and inherited.upper() == key.upper():
+                del env[inherited]
+    env.update(config.get('env', {}))
+    return env
+
+
+def bounded_git(repo, args, max_chars, allowed=(0,), timeout=60, errors='replace'):
+    """Spool to disk with an 8 MiB output ceiling; retain only bounded text in RAM."""
+    import codecs
+    import tempfile
+    limit = 8 * 1024 * 1024
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as error:
+        child = subprocess.Popen(['git', '-C', str(repo), *args], stdin=subprocess.DEVNULL,
+                                 stdout=output, stderr=error)
+        deadline = time.monotonic() + timeout
+        try:
+            while child.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise BridgeError('Git invocation timed out')
+                if os.fstat(output.fileno()).st_size + os.fstat(error.fileno()).st_size > limit:
+                    raise BridgeError('Git output exceeds 8 MiB safety limit')
+                time.sleep(.01)
+            if os.fstat(output.fileno()).st_size + os.fstat(error.fileno()).st_size > limit:
+                raise BridgeError('Git output exceeds 8 MiB safety limit')
+            if child.returncode not in allowed:
+                error.seek(0)
+                raise BridgeError('Git invocation failed: ' + error.read(8192).decode('utf-8', 'replace'))
+            output.seek(0)
+            decoder = codecs.getincrementaldecoder('utf-8')(errors=errors)
+            pieces, kept, total, changed = [], 0, 0, False
+            while True:
+                block = output.read(65536)
+                text = decoder.decode(block, final=not block)
+                total += len(text)
+                changed = changed or bool(text.strip())
+                if kept < max_chars:
+                    prefix = text[:max_chars - kept]
+                    pieces.append(prefix)
+                    kept += len(prefix)
+                if not block:
+                    break
+            return ''.join(pieces), total, changed
+        finally:
+            if child.poll() is None:
+                child.kill()  # This exact Popen owns this newly launched Git handle.
+            child.wait(timeout=10)
 
 
 class Bridge:
@@ -235,6 +313,17 @@ class Bridge:
             if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str)
                                                 for k, v in env.items()):
                 raise ValueError('agent env must be a string mapping')
+            unset_env = value.get('unset_env', [])
+            if not isinstance(unset_env, list) or any(
+                    not isinstance(key, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)
+                    for key in unset_env):
+                raise ValueError('agent unset_env must be a list of environment variable names')
+            policy = value.get('workspace_policy')
+            if policy not in (None, 'opencode-files-only', 'opencode-headless-ask'):
+                raise ValueError('unsupported workspace_policy')
+            if policy == 'opencode-headless-ask' and any(
+                    '--auto' in value.get(role, []) for role in ('build', 'review')):
+                raise ValueError('headless workspace policy forbids --auto')
             executable = shutil.which(argv[0])
             if check_executable and not executable:
                 raise ValueError('agent executable is unavailable')
@@ -244,7 +333,7 @@ class Bridge:
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise BridgeError('invalid or missing agent configuration: ' + str(name)) from exc
 
-    def dispatch_task(self, repo, prompt, agent='claude', test_cmd=None, continue_from=None, timeout_min=None):
+    def dispatch_task(self, repo, prompt, agent='claude', test_cmd=None, continue_from=None, timeout_min=None, frozen_paths=None, swarm_id=None):
         path = self._repo(repo)
         if not isinstance(prompt, str) or not prompt.strip() or '\x00' in prompt:
             raise BridgeError('prompt must be a nonempty string')
@@ -257,10 +346,14 @@ class Bridge:
             raise BridgeError('test_cmd must be a nonempty string or argv string list')
         if isinstance(test_cmd, str) and '\x00' in test_cmd:
             raise BridgeError('test_cmd contains a null byte')
+        frozen_paths = [] if frozen_paths is None else frozen_paths
+        if not isinstance(frozen_paths, list) or any(not isinstance(x, str) or not x or '\\' in x or ':' in x or x.startswith('/') or '..' in Path(x).parts for x in frozen_paths):
+            raise BridgeError('invalid frozen test paths')
         state = self._init(path)
         task_id = uuid.uuid4().hex
         folder = state / 'tasks' / task_id
         with database(path) as db:
+            check_swarm_launch(db, swarm_id)
             prior = load(db, continue_from) if continue_from else None
             if prior:
                 if prior['kind'] != 'build' or prior['status'] in ACTIVE or prior.get('continued_by') or prior.get('cleaned_at'):
@@ -282,9 +375,14 @@ class Bridge:
                         created_at=time.time(), base_head=base, branch=branch, worktree=str(worktree),
                         worktree_owner_id=prior.get('worktree_owner_id', prior['task_id']) if prior else task_id,
                         continue_from=continue_from, task_dir=str(folder), agent=agent, family=config['family'], config=config,
-                        prompt=prompt, test_cmd=test_cmd, timeout_min=timeout,
+                        prompt=prompt, test_cmd=test_cmd, timeout_min=timeout, swarm_id=swarm_id,
                         dirty_main_copied=False, runner_pid=None, runner_created=None,
                         child_pid=None, child_created=None, heartbeat=None)
+            from bridge_contract import capture
+            task['frozen_test_hashes'] = (prior.get('frozen_test_hashes', {}) if prior
+                                          else capture(worktree, frozen_paths))
+            task['baseline_file_hashes'] = (prior.get('baseline_file_hashes', {}) if prior else
+                                             capture(worktree, [x for x in git(worktree, 'ls-files', '-z', strip=False).split('\x00') if x]))
             save(db, task)
         self._spawn(path, task_id)
         return self._public(task)
@@ -318,6 +416,10 @@ class Bridge:
             kwargs['start_new_session'] = True
         with database(repo) as db:
             task = load(db, task_id)
+            if task['status'] == 'queued' and task.get('stop_request'):
+                task.update(status=task['stop_request'], finished_at=time.time())
+                save(db, task)
+                return
             if task['status'] != 'queued' or alive(task.get('runner_pid'), task.get('runner_created')):
                 return
             argv = [sys.executable, str(Path(__file__).with_name('bridge_runner.py')), str(repo), task_id]
@@ -391,17 +493,31 @@ class Bridge:
         with database(path) as db:
             task = load(db, task_id)
         work = Path(task['worktree'])
-        patch = git(work, 'diff', '--no-ext-diff', '--no-textconv', '--binary', task['base_head'], '--', strip=False)
-        files = subprocess.check_output(['git', '-C', str(work), 'ls-files', '--others', '--exclude-standard', '-z'], stdin=subprocess.DEVNULL, timeout=60).decode('utf-8', 'surrogateescape').split('\0')
-        for name in files:
+        patch, total, changed = bounded_git(work, ['diff', '--no-ext-diff', '--no-textconv',
+                                                   '--binary', task['base_head'], '--'], max_chars)
+        listing, length, _ = bounded_git(work, ['ls-files', '--others', '--exclude-standard', '-z'],
+                                         1000000, errors='surrogateescape')
+        if length > 1000000:
+            raise BridgeError('untracked file list exceeds safety limit')
+        pieces, kept = [patch], len(patch)
+        for name in listing.split('\0'):
             if not name:
                 continue
-            result = subprocess.run(['git', '-C', str(work), 'diff', '--no-ext-diff', '--binary', '--no-index', '--', os.devnull, name], capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
-            if result.returncode not in (0, 1):
-                raise BridgeError('cannot diff untracked file: ' + name)
-            patch += '\n' + result.stdout.decode('utf-8', 'replace')
-        return {'task_id': task_id, 'base_head': task['base_head'], 'patch': patch[:max_chars],
-                'truncated': len(patch) > max_chars, 'total_chars': len(patch), 'has_changes': bool(patch.strip())}
+            from bridge_review import _safe_path
+            _safe_path(work, name)
+            if kept < max_chars:
+                pieces.append('\n')
+                kept += 1
+            total += 1
+            text, size, nonempty = bounded_git(work, ['diff', '--no-ext-diff', '--no-textconv',
+                                                    '--binary', '--no-index', '--', os.devnull, name],
+                                               max(0, max_chars - kept), allowed=(0, 1))
+            pieces.append(text)
+            kept += len(text)
+            total += size
+            changed = changed or nonempty
+        return {'task_id': task_id, 'base_head': task['base_head'], 'patch': ''.join(pieces),
+                'truncated': total > max_chars, 'total_chars': total, 'has_changes': changed}
 
     def cancel_task(self, repo, task_id):
         path = self._repo(repo)
@@ -427,9 +543,9 @@ class Bridge:
             save(db, task)
         return self._public(task)
 
-    def review_task(self, repo, task_id, agent='codex', prompt=''):
+    def review_task(self, repo, task_id, agent='codex', prompt='', timeout_min=None, swarm_id=None):
         from bridge_review import review_task
-        return review_task(self, repo, task_id, agent, prompt)
+        return review_task(self, repo, task_id, agent, prompt, timeout_min, swarm_id)
 
     def cleanup_task(self, repo, task_id, force=False):
         path = self._repo(repo)

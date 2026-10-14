@@ -240,3 +240,7 @@ those before merging. Call cleanup only after merge or approved abandonment.
 Webhook/Slack/Telegram completion delivery, automatic test-command discovery,
 Nimbalyst session-board mirroring, auto-merge, and GUI-only agent control. Hermes
 can relay questions and poll status; external notifications are future work.
+
+## Bounded unattended swarms
+
+Four swarm MCP tools supplement the original nine task tools. They provide a bounded queue of isolated shards, explicit Haiku 5.5 `max` fallback, real tests and fresh independent review. No automatic merge or push. See [UNATTENDED.md](UNATTENDED.md) for setup, operating limits, cancellation/recovery and standalone CLI usage.

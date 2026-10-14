@@ -6,7 +6,8 @@
 - Public success status is `done`, not `completed`. Review is a separate object
   in build `get_status`, with `status` and `verdict` keys.
 - Strict final review verdict: `VERDICT: APPROVE` or `VERDICT: CHANGES_REQUESTED`.
-- All nine tools must work through an actual stdio MCP client, not only in-process.
+- All thirteen tools must work through an actual stdio MCP client, not only in-process.
+  Four swarm tools supplement the original nine task tools; see UNATTENDED.md.
   `tests/test_mcp.py` tests discovery/refusal and dispatch/server restart/review.
 - Safety tests include NTFS junction redirection of `.bridge`, nonfinite/nonpositive
   timeout inputs, and malformed test argv. Refuse before filesystem side effects.

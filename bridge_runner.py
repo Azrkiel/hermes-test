@@ -1,5 +1,6 @@
 """Detached worker. Invoke with repository path and task ID; no external service needed."""
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -7,7 +8,7 @@ from pathlib import Path
 
 import psutil
 
-from bridge_core import database, git, load, save, terminate_tree
+from bridge_core import child_env, database, git, load, save, terminate_tree
 
 
 class Stopped(Exception):
@@ -54,6 +55,8 @@ def execute(repo, task_id, command, log_name, deadline, env, input_text=None):
             log = (Path(task['task_dir']) / log_name).open('ab')
             if os.name == 'nt':
                 job = invocation_job()
+            # Native CLIs can choose their workspace from PWD rather than cwd.
+            env = {**env, 'PWD': str(Path(task['worktree']).resolve())}
             child = subprocess.Popen(command, shell=isinstance(command, str), cwd=task['worktree'], env=env,
                                      stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
                                      stdout=log, stderr=log, start_new_session=(os.name != 'nt'),
@@ -77,11 +80,22 @@ def execute(repo, task_id, command, log_name, deadline, env, input_text=None):
                     pass
             threading.Thread(target=feed, daemon=True).start()
         while True:
-            with database(repo) as db:
-                current = load(db, task_id)
-                current['heartbeat'] = time.time()
-                stop = current.get('stop_request')
-                save(db, current)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Stopped('timed_out')
+            try:
+                # A busy writer must not postpone process termination for 30 seconds.
+                with database(repo, min(.1, remaining)) as db:
+                    current = load(db, task_id)
+                    current['heartbeat'] = time.time()
+                    stop = current.get('stop_request')
+                    save(db, current)
+            except sqlite3.OperationalError as exc:
+                if getattr(exc, 'sqlite_errorcode', None) not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise
+                # Retry only contention, always through the deadline check above.
+                time.sleep(min(.01, max(0, deadline - time.monotonic())))
+                continue
             if not stop and time.monotonic() >= deadline:
                 stop = 'timed_out'
             if stop:
@@ -121,6 +135,19 @@ def execute(repo, task_id, command, log_name, deadline, env, input_text=None):
             primary.add_note(f'Invocation cleanup also failed: {cleanup_error!r}')
 
 
+def purge_python_bytecode(worktree):
+    """Remove executable caches before trusted tests, including -E/-I commands."""
+    from bridge_review import _safe_path
+    root = Path(worktree)
+    for args in (('--cached', '--others'), ('--others', '--ignored')):
+        names = git(root, 'ls-files', *args, '--exclude-standard', '-z', strip=False)
+        for name in names.split('\0'):
+            if name and Path(name).suffix.casefold() in ('.pyc', '.pyo'):
+                path = _safe_path(root, name)
+                if path is not None:
+                    path.unlink()
+
+
 def run(repo, task_id):
     from bridge_core import recover_states
     while True:
@@ -151,16 +178,29 @@ def run(repo, task_id):
             break
         time.sleep(.15)
     deadline = time.monotonic() + task['timeout_min'] * 60
-    code = test_code = error = None
+    code = test_code = error = tested_fingerprint = None
     try:
         result_file = str(Path(task['task_dir']) / 'result.txt')
-        argv = [a.replace('{prompt}', task['prompt'])
+        prompt = task['prompt']
+        if task['config'].get('workspace_policy'):
+            prompt += ('\nWORKTREE: ' + task['worktree'] +
+                       '\nFILE-TOOLS-ONLY: Use Read/Edit/Write on the named relative module. '
+                       'Do not use shell, glob, grep, subagents, external paths, or config edits. '
+                       'Do not run tests or install packages. The trusted bridge executes the supplied test command. '
+                       'After implementing the requested file edits, finish without running verification tools.')
+        argv = [a.replace('{prompt}', prompt)
                 .replace('{prompt_file}', str(Path(task['task_dir']) / 'prompt.txt'))
                 .replace('{result_file}', result_file)
                 for a in task['config'][task['kind']]]
-        env = os.environ.copy()
-        env.update(task['config'].get('env', {}))
-        code = execute(repo, task_id, argv, 'output.log', deadline, env, task['prompt'] if task['config'].get('stdin_prompt') else None)
+        env = child_env(task['config'])
+        if task['config'].get('workspace_policy') == 'opencode-headless-ask':
+            # Fresh approval/session state; preserve HOME/USERPROFILE and config.
+            env['XDG_DATA_HOME'] = str(Path(task['task_dir']) / 'opencode-data')
+            env['XDG_STATE_HOME'] = str(Path(task['task_dir']) / 'opencode-state')
+        from bridge_workspace import workspace_guard
+        with workspace_guard(task, task['config']):
+            code = execute(repo, task_id, argv, 'output.log', deadline, env,
+                           prompt if task['config'].get('stdin_prompt') else None)
         if task['kind'] == 'review':
             from bridge_review import finish_review
             finish_review(repo, task_id, code, 'done' if code == 0 else 'failed')
@@ -171,9 +211,20 @@ def run(repo, task_id):
                 current = load(db, task_id)
                 current['status'] = 'testing'
                 save(db, current)
-            test_code = execute(repo, task_id, task['test_cmd'], 'test.log', deadline, env)
+            purge_python_bytecode(task['worktree'])
+            from bridge_contract import verify
+            verify(task)
+            from bridge_review import fingerprint_worktree
+            tested_input = fingerprint_worktree(task['worktree'], task['base_head'])
+            import tempfile
+            # Fresh private cache: never load bytecode installed by the builder.
+            cache = tempfile.mkdtemp(prefix='test-python-', dir=task['task_dir'])
+            test_env = {**env, 'PYTHONPYCACHEPREFIX': cache}
+            test_code = execute(repo, task_id, task['test_cmd'], 'test.log', deadline, test_env)
             if test_code:
                 status = 'tests_failed'
+            else:
+                tested_fingerprint = tested_input
         if status == 'done':
             if not git(task['worktree'], 'diff', '--no-ext-diff', task['base_head'], '--') and not git(task['worktree'], 'ls-files', '--others', '--exclude-standard'):
                 status = 'no_changes'
@@ -188,7 +239,8 @@ def run(repo, task_id):
     with database(repo) as db:
         task = load(db, task_id)
         task.update(status=task.get('stop_request') or status, exit_code=code, test_exit_code=test_code,
-                    error=error, finished_at=time.time(), heartbeat=time.time())
+                    tested_fingerprint=tested_fingerprint, error=error,
+                    finished_at=time.time(), heartbeat=time.time())
         save(db, task)
 
 

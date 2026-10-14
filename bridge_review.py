@@ -13,12 +13,11 @@ import os
 import re
 import shutil
 import stat
-import subprocess
 import time
 import uuid
 from pathlib import Path
 
-from bridge_core import ACTIVE, BridgeError, database, git, load, records, save
+from bridge_core import ACTIVE, BridgeError, check_swarm_launch, database, git, load, records, save
 
 MAX_PATCH = 2 * 1024 * 1024
 
@@ -46,10 +45,19 @@ def _files(worktree):
     info = root.lstat()
     if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
         raise BridgeError('unsafe review worktree')
-    result = subprocess.run(['git', '-C', str(root), 'ls-files', '--cached', '--others', '--exclude-standard', '-z'], capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
-    if result.returncode:
-        raise BridgeError('cannot enumerate review files')
-    names = sorted(set(result.stdout.decode('utf-8', 'surrogateescape').split('\0')) - {''})
+    from bridge_core import bounded_git
+    listing, length, _ = bounded_git(root, ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+                                     1000000, errors='surrogateescape')
+    if length > 1000000:
+        raise BridgeError('review file manifest exceeds safety limit')
+    ignored, ignored_length, _ = bounded_git(root,
+        ['ls-files', '--others', '--ignored', '--exclude-standard', '-z'],
+        1000000, errors='surrogateescape')
+    if ignored_length > 1000000:
+        raise BridgeError('ignored file manifest exceeds safety limit')
+    bytecode = {name for name in ignored.split('\0')
+                if Path(name).suffix.casefold() in ('.pyc', '.pyo')}
+    names = sorted((set(listing.split('\0')) | bytecode) - {''})
     output = []
     for name in names:
         if any(part.lower() in ('.git', '.bridge') for part in Path(name).parts):
@@ -93,15 +101,23 @@ def _validate(db, task_id, family):
     return task
 
 
-def review_task(bridge, repo, task_id, agent='codex', prompt=''):
+def review_task(bridge, repo, task_id, agent='codex', prompt='', timeout_min=None, swarm_id=None):
     path = bridge._repo(repo)
     if not isinstance(prompt, str):
         raise BridgeError('review prompt must be a string')
     config = bridge._agent(agent, 'review')
+    timeout = bridge._timeout(bridge.timeout_min if timeout_min is None else timeout_min)
     state = bridge._init(path)
     with database(path) as db:
         builder = _validate(db, task_id, config['family'])
+        swarm_id = swarm_id or builder.get('swarm_id')
+        check_swarm_launch(db, swarm_id)
+    from bridge_contract import verify
+    verify(builder)
     source_fingerprint = fingerprint(bridge, path, builder)
+    if builder.get('test_cmd') and builder.get('test_exit_code') == 0:
+        if builder.get('tested_fingerprint') != source_fingerprint:
+            raise BridgeError('current source is not the successfully tested artifact; rerun tests')
     # get_diff acquires a database lock itself, so keep it outside our transaction.
     # Public diff requests have a tighter 1,000,000-character safety cap.
     # Refusing its truncation remains fail-closed below the review upper bound.
@@ -112,6 +128,7 @@ def review_task(bridge, repo, task_id, agent='codex', prompt=''):
     folder = state / 'tasks' / review_id
     snapshot = state / 'reviews' / review_id / 'snapshot'
     with database(path) as db:
+        check_swarm_launch(db, swarm_id)
         builder = _validate(db, task_id, config['family'])
         if fingerprint(bridge, path, builder) != source_fingerprint:
             raise BridgeError('builder changed while preparing review')
@@ -141,7 +158,7 @@ def review_task(bridge, repo, task_id, agent='codex', prompt=''):
             task = dict(task_id=review_id, repo=str(path), kind='review', build_task_id=task_id,
                         status='queued', created_at=time.time(), worktree=str(snapshot), task_dir=str(folder),
                         base_head=base, branch=None, agent=agent, family=config['family'], config=config,
-                        prompt=review_prompt, timeout_min=bridge.timeout_min, test_cmd=None,
+                        prompt=review_prompt, timeout_min=timeout, test_cmd=None,
                         runner_pid=None, runner_created=None, child_pid=None, child_created=None,
                         heartbeat=None, source_fingerprint=source_fingerprint,
                         snapshot_fingerprint=_snapshot_fingerprint(snapshot, base))
@@ -175,7 +192,11 @@ def _snapshot_fingerprint(worktree, basehead):
             relative = candidate.relative_to(root).as_posix()
             safe = _safe_path(root, relative)
             digest.update(relative.encode('utf-8', 'surrogateescape') + b'\0')
-            digest.update(hashlib.sha256(safe.read_bytes()).digest())
+            file_digest = hashlib.sha256()
+            with safe.open('rb') as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b''):
+                    file_digest.update(block)
+            digest.update(file_digest.digest())
     return digest.hexdigest()
 
 
@@ -270,8 +291,12 @@ def attach_review(bridge, repo, build_task):
         except (BridgeError, OSError):
             invalidated = True
     nested.setdefault('verdict', None)
+    nested['lifecycle_status'] = review['status']
     if invalidated:
-        nested.update(status='invalidated', verdict=None, error='builder changed or was continued/cleaned')
+        nested.update(content_status='invalidated', verdict=None,
+                      error='builder changed or was continued/cleaned')
+        if nested['status'] not in ACTIVE:
+            nested['status'] = 'invalidated'
     result['review'] = nested
     result['review_status'] = ('invalidated' if invalidated else
                                'approved' if nested['verdict'] == 'APPROVE' else

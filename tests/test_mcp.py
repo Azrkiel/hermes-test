@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOLS = {
     'dispatch_task', 'get_status', 'list_tasks', 'get_diff', 'review_task',
     'cancel_task', 'ask_human', 'cleanup_task', 'list_agents',
+    'dispatch_swarm', 'get_swarm', 'cancel_swarm', 'list_swarms',
 }
 
 

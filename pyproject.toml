@@ -13,7 +13,7 @@ dependencies = ["mcp>=1.20,<2", "psutil>=6,<8", "pywin32>=306; sys_platform == '
 dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.8,<1"]
 
 [tool.setuptools]
-py-modules = ["bridge_core", "bridge_runner", "bridge_review", "bridge_server"]
+py-modules = ["bridge_core", "bridge_runner", "bridge_review", "bridge_server", "bridge_swarm", "bridge_power", "bridge_workspace", "bridge_contract"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
