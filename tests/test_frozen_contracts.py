@@ -102,6 +102,41 @@ def test_hidden_tracked_edit_cannot_escape_scope(lab):
     assert state["items"][0]["status"] == "scope_violation"
 
 
+def test_unowned_mode_change_cannot_escape_scope(lab):
+    import os
+
+    repo, bridge = lab
+    git(repo, "config", "core.filemode", "false")
+    mode = 0o444 if os.name == "nt" else 0o755
+    data = json.loads(bridge.agents_file.read_text())
+    data["agents"]["builder"]["build"] = [
+        sys.executable, "-c",
+        "from pathlib import Path;Path('one.py').write_text('VALUE=42\\n');"
+        f"Path('README.md').chmod({mode})",
+    ]
+    bridge.agents_file.write_text(json.dumps(data))
+    manager = swarm(bridge)
+    created = manager.start(str(repo), [shard("one")], agent="builder",
+                            reviewer="reviewer", workers=2, autostart=False)
+    state = wait_swarm(manager, repo, created["swarm_id"])
+    try:
+        assert state["items"][0]["status"] == "scope_violation"
+        assert state["items"][0]["review_id"] is None
+    finally:
+        task = bridge.get_status(str(repo), state["items"][0]["task_id"], log_lines=0)
+        from pathlib import Path
+        (Path(task["worktree"]) / "README.md").chmod(0o666)
+
+
+def test_legacy_mode_baseline_is_not_silently_trusted(lab, monkeypatch):
+    repo, bridge = lab
+    monkeypatch.setattr(bridge, "_spawn", lambda *args: None)
+    task = bridge.dispatch_task(str(repo), "one", agent="builder")
+    task.pop("baseline_file_modes", None)
+    error = swarm(bridge)._scope_error({"spec": {"files": ["one.py"]}}, task)
+    assert error and "mode" in error
+
+
 def test_custom_contract_ownership_rejected(lab):
     repo, bridge = lab
     (repo / "check.py").write_text("assert True\n")

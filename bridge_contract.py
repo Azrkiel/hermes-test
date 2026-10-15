@@ -56,6 +56,17 @@ def capture(work, paths):
     return result
 
 
+def capture_modes(worktree, paths):
+    from bridge_review import _safe_path
+    result = {}
+    for name in paths:
+        path = _safe_path(Path(worktree), name)
+        if path is None:
+            raise BridgeError('baseline file missing: ' + name)
+        result[name] = path.stat().st_mode & 0o777
+    return result
+
+
 def verify(task):
     expected = task.get("frozen_test_hashes", {})
     if expected and capture(task["worktree"], list(expected)) != expected:

@@ -58,9 +58,13 @@ def test_executable_cache_is_not_exempt_from_shard_ownership(lab):
     git(repo, 'add', '.gitignore')
     git(repo, 'commit', '-m', 'ignored caches')
     head = git(repo, 'rev-parse', 'HEAD')
+    from bridge_contract import capture, capture_modes
+    baseline = [name for name in git(repo, 'ls-files', '-z', strip=False).split('\x00') if name]
+    task = {'worktree': str(repo), 'base_head': head,
+            'baseline_file_hashes': capture(repo, baseline),
+            'baseline_file_modes': capture_modes(repo, baseline)}
     cache = repo / '__pycache__'
     cache.mkdir()
     (cache / 'contract.pyc').write_bytes(b'executable cache')
-    task = {'worktree': str(repo), 'base_head': head}
     item = {'spec': {'files': ['one.py']}}
     assert Swarm(bridge)._scope_error(item, task) == 'worker changed files outside ownership'

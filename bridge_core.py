@@ -268,6 +268,9 @@ class Bridge:
         default_agents = Path.home() / '.agent-bridge' / 'agents.json'
         if not default_agents.exists():
             default_agents = Path(__file__).with_name('agents.example.json')
+        if not default_agents.exists():
+            from importlib.resources import files
+            default_agents = Path(str(files('bridge_defaults').joinpath('agents.example.json')))
         self.agents_file = Path(agents_file or os.environ.get('BRIDGE_AGENTS_FILE') or default_agents)
         raw_cap = max_parallel if max_parallel is not None else os.environ.get('BRIDGE_MAX_PARALLEL', '3')
         if isinstance(raw_cap, bool) or not re.fullmatch(r'[1-9][0-9]*', str(raw_cap)):
@@ -383,6 +386,9 @@ class Bridge:
                                           else capture(worktree, frozen_paths))
             task['baseline_file_hashes'] = (prior.get('baseline_file_hashes', {}) if prior else
                                              capture(worktree, [x for x in git(worktree, 'ls-files', '-z', strip=False).split('\x00') if x]))
+            from bridge_contract import capture_modes
+            task['baseline_file_modes'] = (prior.get('baseline_file_modes') if prior else
+                                            capture_modes(worktree, task['baseline_file_hashes']))
             save(db, task)
         self._spawn(path, task_id)
         return self._public(task)

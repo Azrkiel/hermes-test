@@ -44,6 +44,10 @@ Example task element:
 
 Inspect per-item `task_id` and `review_id` with `get_status` when a swarm needs attention. Correct the reported issue, rerun tests and request fresh review; never overwrite an old verdict or reuse approval after a continuation. Do not delete failed-run records to make readiness look green.
 
+Tracked file modes are captured before a new builder starts and inherited unchanged across continuations. Ownership checks compare them independently of Git's `core.filemode` setting. Legacy records without a mode baseline fail closed; rerun those shards with the current bridge rather than reconstructing a baseline from already-modified worktrees.
+
+Source fingerprints use version 2 framing: length-prefixed fields and fixed-size streamed file digests prevent binary content from being mistaken for another file entry. Pre-v2 tested fingerprints and approvals are intentionally invalidated. Rerun those builds/tests and obtain fresh independent review; never rewrite old fingerprint fields to preserve an approval.
+
 ## Standalone CLI
 
 Use the source checkout's Python environment with native Windows paths. Set `BRIDGE_ALLOWED_ROOTS` to a JSON array of narrow allowed roots and `BRIDGE_AGENTS_FILE` to trusted agent JSON, or pass `--roots` and `--agents` explicitly.
@@ -57,7 +61,7 @@ A plan is a JSON object with `tasks`, and optionally `agent`, `reviewer`, `fallb
 .venv/Scripts/python.exe bridge_swarm.py --list "C:/path/to/repo"
 ```
 
-The source-checkout installation is supported. An external agent configuration is required for installed wheels because the legacy fallback JSON is not packaged. Never include credentials, `.venv`, `.bridge` or private verification evidence in publication.
+The source checkout and installed wheel are supported. The wheel includes the public agent defaults; an explicit `BRIDGE_AGENTS_FILE` or per-user `~/.agent-bridge/agents.json` takes precedence. Configure native CLI executable paths and authenticate the official clients before running real jobs. Never include credentials, `.venv`, `.bridge` or private verification evidence in publication.
 
 ## Frozen contracts
 

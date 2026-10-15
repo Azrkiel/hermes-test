@@ -69,18 +69,22 @@ def _files(worktree):
 
 
 def fingerprint_worktree(worktree, basehead):
-    """Hash HEAD, index changes, filenames/modes and actual tracked/untracked bytes."""
-    digest = hashlib.sha256()
+    """Bind framed metadata and fixed-size streamed file digests; v2 invalidates old approvals."""
+    digest = hashlib.sha256(b'bridge-source-fingerprint-v2\0')
     for value in (basehead, git(worktree, 'rev-parse', 'HEAD'),
                   git(worktree, 'diff', '--cached', '--no-ext-diff', '--binary', '--')):
-        digest.update(value.encode('utf-8', 'surrogateescape') + b'\0')
+        encoded = value.encode('utf-8', 'surrogateescape')
+        digest.update(len(encoded).to_bytes(8, 'big'))
+        digest.update(encoded)
     for name, path in _files(worktree):
-        digest.update(name.encode('utf-8', 'surrogateescape') + b'\0')
-        digest.update(str(path.stat().st_mode & 0o777).encode() + b'\0')
+        content = hashlib.sha256()
         with path.open('rb') as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b''):
-                digest.update(block)
-        digest.update(b'\0')
+                content.update(block)
+        for field in (name.encode('utf-8', 'surrogateescape'),
+                      str(path.stat().st_mode & 0o777).encode(), content.digest()):
+            digest.update(len(field).to_bytes(8, 'big'))
+            digest.update(field)
     return digest.hexdigest()
 
 
@@ -174,9 +178,15 @@ def review_task(bridge, repo, task_id, agent='codex', prompt='', timeout_min=Non
 
 
 def _snapshot_fingerprint(worktree, basehead):
-    """Include ignored new files too: a reviewer must not mutate its snapshot."""
+    """Hash every snapshot entry once, including ignored files and their modes."""
     root = Path(worktree)
-    digest = hashlib.sha256(fingerprint_worktree(root, basehead).encode())
+    info = root.lstat()
+    if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+        raise BridgeError('unsafe review worktree')
+    digest = hashlib.sha256()
+    for value in (basehead, git(root, 'rev-parse', 'HEAD'),
+                  git(root, 'diff', '--cached', '--no-ext-diff', '--binary', '--')):
+        digest.update(value.encode('utf-8', 'surrogateescape') + b'\0')
     for directory, dirs, files in os.walk(root, followlinks=False):
         if Path(directory) == root:
             dirs[:] = [d for d in dirs if d != '.git']
@@ -192,6 +202,7 @@ def _snapshot_fingerprint(worktree, basehead):
             relative = candidate.relative_to(root).as_posix()
             safe = _safe_path(root, relative)
             digest.update(relative.encode('utf-8', 'surrogateescape') + b'\0')
+            digest.update(str(safe.stat().st_mode & 0o777).encode() + b'\0')
             file_digest = hashlib.sha256()
             with safe.open('rb') as stream:
                 for block in iter(lambda: stream.read(1024 * 1024), b''):

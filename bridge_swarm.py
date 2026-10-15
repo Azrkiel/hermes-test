@@ -158,7 +158,6 @@ class Swarm:
         path = self.bridge._repo(repo)
         with database(path) as db:
             data = self._load(db, swarm_id)
-        self._fresh_approvals(path, data)
         if data.get('auto_run') and data['status'] in ('queued', 'running'):
             self._spawn(path, swarm_id, recovery=True)
             with database(path) as db:
@@ -226,12 +225,17 @@ class Swarm:
         from bridge_review import _safe_path
         actual_changed = []
         for name, expected in task.get('baseline_file_hashes', {}).items():
-            if _safe_path(Path(work), name) is None or capture(work, [name])[name] != expected:
+            path = _safe_path(Path(work), name)
+            if (path is None or capture(work, [name])[name] != expected or
+                    path.stat().st_mode & 0o777 != task['baseline_file_modes'][name]):
                 actual_changed.append(name)
         return sorted(set((tracked + untracked).split('\x00')) - {''} | set(relevant) | set(actual_changed))
 
     def _scope_error(self, item, task):
         from bridge_review import _files, _safe_path
+        modes = task.get('baseline_file_modes')
+        if not isinstance(modes, dict) or set(modes) != set(task.get('baseline_file_hashes', {})):
+            return 'baseline file modes unavailable; rerun shard with the current bridge'
         names = self._changed(task)
         if any(not any(name.casefold() == own.rstrip('/').casefold() or
                        (own.endswith('/') and name.casefold().startswith(own.casefold()))
@@ -248,7 +252,7 @@ class Swarm:
         pieces = [item['spec']['prompt'], 'Review the supplied full changed files and real tests. '
                   'Do not use tools or modify files. If evidence is insufficient request changes.',
                   'TEST COMMAND: ' + json.dumps(item['spec']['test_cmd']),
-                  'ACTUAL TEST OUTPUT:\n' + task.get('test_log', '')]
+                  'ACTUAL TEST OUTPUT (bounded tail; earlier output may be omitted):\n' + task.get('test_log', '')]
         remaining = 200000 - sum(len(piece) + 2 for piece in pieces)
         for name in self._changed(task):
             path = _safe_path(Path(task['worktree']), name)
