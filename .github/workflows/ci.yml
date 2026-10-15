@@ -1,0 +1,58 @@
+{
+  "name": "Qualification (no deployment)",
+  "on": {
+    "push": {"branches": ["main", "feat/project-pipeline"]},
+    "pull_request": {},
+    "workflow_dispatch": {}
+  },
+  "permissions": {"contents": "read"},
+  "concurrency": {
+    "group": "qualification-${{ github.workflow }}-${{ github.ref }}",
+    "cancel-in-progress": false
+  },
+  "jobs": {
+    "qualification": {
+      "strategy": {
+        "fail-fast": false,
+        "matrix": {"os": ["ubuntu-latest", "windows-latest"]}
+      },
+      "runs-on": "${{ matrix.os }}",
+      "timeout-minutes": 35,
+      "steps": [
+        {
+          "name": "Checkout (actions/checkout v7.0.1)",
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {"persist-credentials": false}
+        },
+        {
+          "name": "Python (actions/setup-python v7.0.0)",
+          "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+          "with": {"python-version": "3.11"}
+        },
+        {
+          "name": "Install test/build dependencies",
+          "run": "python -m pip install --disable-pip-version-check .[dev] build"
+        },
+        {
+          "name": "Tests (deterministic local CLI fixtures; no provider logins)",
+          "run": "python -m pytest tests/ -q -p no:cacheprovider --tb=short --junitxml=qualification-pytest.xml"
+        },
+        {
+          "name": "Build installable wheel",
+          "run": "python -m build --wheel --no-isolation"
+        },
+        {
+          "name": "Retain test report and wheel (actions/upload-artifact v7.0.2)",
+          "if": "always()",
+          "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "with": {
+            "name": "qualification-${{ matrix.os }}-${{ github.sha }}",
+            "path": "qualification-pytest.xml\ndist/*.whl",
+            "retention-days": 7,
+            "if-no-files-found": "warn"
+          }
+        }
+      ]
+    }
+  }
+}
